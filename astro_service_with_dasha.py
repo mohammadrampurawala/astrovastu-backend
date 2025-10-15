@@ -150,9 +150,53 @@ def compute_chart(data: BirthData):
     # compute planets
     planets_out = {}
     for name, pid in PLANETS.items():
-        res = swe.calc_ut(jd_ut, pid)
-        lon_deg = normalize_angle(res[0])
-        planets_out[name] = {'longitude': lon_deg, 'latitude': res[1], 'speed_long': res[3]}
+        # --- Safe extraction for ephemeris results ---
+def _extract_from_res(res):
+    """
+    Accepts res which might be:
+     - a float/number
+     - a tuple/list with elements (longitude, latitude, distance, speed_long, ...)
+    Returns a dict with keys: longitude, latitude, speed_long (values may be None).
+    """
+    # default values
+    out = {"longitude": None, "latitude": None, "speed_long": None}
+
+    # If res is not a sequence, try to convert to float (it's probably the longitude)
+    try:
+        # numpy arrays also behave as sequences, so handle carefully
+        if isinstance(res, (list, tuple)):
+            if len(res) >= 1:
+                out["longitude"] = float(res[0])
+            if len(res) >= 2:
+                out["latitude"] = float(res[1])
+            if len(res) >= 4:
+                out["speed_long"] = float(res[3])
+        else:
+            # scalar case
+            out["longitude"] = float(res)
+    except Exception as e:
+        # log unexpected format for debugging; keep values as None where extraction failed
+        print(f"Warning: unable to parse ephemeris result {res!r} -> {e}")
+
+    return out
+
+# Example usage inside your planet loop
+# (replace the existing assignment with the block below)
+try:
+    res = swe.calc_ut(utc_jd, planet_id)  # or whatever call you have
+except Exception as e:
+    print(f"Ephemeris call failed for {name} with error: {e}")
+    res = None
+
+vals = _extract_from_res(res)
+if vals["longitude"] is None:
+    # if no longitude, record the problem and continue — don't raise IndexError
+    print(f"compute_chart: no longitude for planet {name}; raw res={res!r}")
+    planets_out[name] = {"longitude": None, "latitude": vals["latitude"], "speed_long": vals["speed_long"]}
+else:
+    lon_deg = normalize_angle(vals["longitude"])
+    planets_out[name] = {"longitude": lon_deg, "latitude": vals["latitude"], "speed_long": vals["speed_long"]}
+
 
     # compute Ketu as Rahu + 180
     rahu_lon = planets_out['Rahu']['longitude']
@@ -285,3 +329,4 @@ def compute_dasha(data: BirthData):
 
 # To run:
 # uvicorn astro_service_with_dasha:app --port 8000 --reload
+
