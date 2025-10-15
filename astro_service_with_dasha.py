@@ -17,9 +17,11 @@ import swisseph as swe
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from datetime import datetime, timezone, timedelta
-from dateutil import tz
+from dateutil import parser as dateutil_parser
+import pytz
 from timezonefinder import TimezoneFinder
 from geopy.geocoders import Nominatim
+from fastapi.responses import JSONResponse
 import math
 
 app = FastAPI(title="Astro Service with Dasha")
@@ -60,110 +62,38 @@ NAK_TO_START_PLANET_INDEX = [
 geolocator = Nominatim(user_agent="astrovastu_pro")
 tzfinder = TimezoneFinder()
 
+# -----------------------
+# Helper & Request Model
+# -----------------------
 class BirthData(BaseModel):
-    date: str  # YYYY-MM-DD
-    time: str  # HH:MM (24h)
-    place: str  # "City, Country" or "lat,lon"
-    lat: float = None
-    lon: float = None
-    timezone: str = None  # optional IANA
-    sidereal: bool = False  # default tropical
+    date: str
+    time: str
+    place: str
+    lat: float | None = None
+    lon: float | None = None
+    timezone: str | None = None
+    sidereal: bool | None = False
 
-def normalize_angle(angle):
-    """
-    Normalize an angle to 0..360 degrees.
-    Accepts a float/int OR a sequence (tuple/list/np.array) where the first element is the angle.
-    """
-    # If angle is a sequence (tuple/list/ndarray...), try to extract the first element
+def normalize_angle(deg):
+    """Normalize angle to 0..360 float."""
     try:
-        # Protect against strings (they are sequences but not what we want)
-        if not isinstance(angle, (str, bytes)) and hasattr(angle, "__len__"):
-            # get first element (works for tuple/list/numpy array)
-            angle_val = angle[0]
-        else:
-            angle_val = angle
-        a = float(angle_val)
+        d = float(deg) % 360.0
+        if d < 0:
+            d += 360.0
+        return d
     except Exception:
-        # Re-raise with helpful message for debugging
-        raise TypeError(f"normalize_angle: could not convert angle {angle!r} to float")
+        return None
 
-    a = a % 360.0
-    if a < 0:
-        a += 360.0
-    return a
-
-def parse_place(place, lat, lon):
-    if lat is not None and lon is not None:
-        return lat, lon
-    try:
-        if ',' in place:
-            parts = place.split(',')
-            latf = float(parts[0].strip()); lonf = float(parts[1].strip())
-            return latf, lonf
-    except:
-        pass
-    loc = geolocator.geocode(place, timeout=10)
-    if not loc:
-        raise ValueError("Could not geocode place. Provide lat,lon or clearer place.")
-    return loc.latitude, loc.longitude
-
-def local_to_utc_datetime(date_str, time_str, tz_name, lat=None, lon=None):
-    """Return a timezone-aware UTC datetime for the provided local date/time & tz name.
-       tz_name if None will be inferred from lat/lon."""
-    naive = datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M")
-    if not tz_name:
-        if lat is None or lon is None:
-            raise ValueError("Timezone unknown and lat/lon not provided.")
-        tz_name = tzfinder.timezone_at(lat=lat, lng=lon)
-        if not tz_name:
-            raise ValueError("Could not infer timezone.")
-    local_tz = tz.gettz(tz_name)
-    if local_tz is None:
-        raise ValueError("Invalid timezone provided.")
-    local_dt = naive.replace(tzinfo=local_tz)
-    utc_dt = local_dt.astimezone(timezone.utc)
-    return utc_dt
-
-def jd_from_utc_dt(utc_dt):
-    """Compute Julian day (UT) from a timezone-aware UTC datetime."""
-    year = utc_dt.year; month = utc_dt.month; day = utc_dt.day
-    hour = utc_dt.hour + utc_dt.minute/60.0 + utc_dt.second/3600.0
-    return swe.julday(year, month, day, hour)
-
-@app.post("/compute_chart")
-def compute_chart(data: BirthData):
-    lat, lon = parse_place(data.place, data.lat, data.lon)
-    tz_name = data.timezone or tzfinder.timezone_at(lat=lat, lng=lon)
-    try:
-        utc_dt = local_to_utc_datetime(data.date, data.time, tz_name, lat, lon)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-    jd_ut = jd_from_utc_dt(utc_dt)
-
-    # set sidereal mode if requested (Lahiri)
-    if data.sidereal:
-        swe.set_sid_mode(swe.SIDM_LAHIRI)
-    else:
-        swe.set_sid_mode(swe.SIDM_FAGAN_BRADLEY)
-
-    # compute planets
-    planets_out = {}
-    for name, pid in PLANETS.items():
-        # --- Safe extraction for ephemeris results ---
 def _extract_from_res(res):
     """
     Accepts res which might be:
      - a float/number
      - a tuple/list with elements (longitude, latitude, distance, speed_long, ...)
-    Returns a dict with keys: longitude, latitude, speed_long (values may be None).
+    Returns dict with keys: longitude, latitude, speed_long (values may be None).
     """
-    # default values
     out = {"longitude": None, "latitude": None, "speed_long": None}
-
-    # If res is not a sequence, try to convert to float (it's probably the longitude)
     try:
-        # numpy arrays also behave as sequences, so handle carefully
+        # sequence-like
         if isinstance(res, (list, tuple)):
             if len(res) >= 1:
                 out["longitude"] = float(res[0])
@@ -172,30 +102,184 @@ def _extract_from_res(res):
             if len(res) >= 4:
                 out["speed_long"] = float(res[3])
         else:
-            # scalar case
+            # scalar case (just a number)
             out["longitude"] = float(res)
     except Exception as e:
-        # log unexpected format for debugging; keep values as None where extraction failed
+        # log for debugging; Render will show prints
         print(f"Warning: unable to parse ephemeris result {res!r} -> {e}")
-
     return out
 
-# Example usage inside your planet loop
-# (replace the existing assignment with the block below)
-try:
-    res = swe.calc_ut(utc_jd, planet_id)  # or whatever call you have
-except Exception as e:
-    print(f"Ephemeris call failed for {name} with error: {e}")
-    res = None
+def _parse_datetime_to_utc_jd(date_str: str, time_str: str, tz_name: str | None):
+    """
+    Parse local date/time to UTC datetime and return Swiss Ephemeris Julian Day (UT).
+    """
+    # Combine date/time and parse
+    dt_local = dateutil_parser.parse(f"{date_str} {time_str}")
+    # If user supplied timezone, use it; else assume naive -> treat as local system tz?
+    # Prefer explicit timezone input; if missing, assume UTC for safety (or you can default to Asia/Kolkata)
+    if tz_name:
+        try:
+            tz = pytz.timezone(tz_name)
+            dt_local = tz.localize(dt_local) if dt_local.tzinfo is None else dt_local.astimezone(tz)
+        except Exception as e:
+            # fallback: assume naive datetimes are local system tz
+            print(f"Warning: timezone parse failed ({tz_name}) -> {e}")
+    # Ensure dt is timezone-aware and convert to UTC
+    if dt_local.tzinfo is None:
+        # treat naive as UTC to avoid ambiguity; if you prefer treat as local, change here
+        dt_utc = dt_local.replace(tzinfo=pytz.UTC)
+    else:
+        dt_utc = dt_local.astimezone(pytz.UTC)
+    # compute decimal hour
+    h = dt_utc.hour + dt_utc.minute / 60.0 + dt_utc.second / 3600.0 + dt_utc.microsecond / 3_600_000_000.0
+    # use swe.julday
+    jd_ut = swe.julday(dt_utc.year, dt_utc.month, dt_utc.day, h)
+    return dt_utc, jd_ut
 
-vals = _extract_from_res(res)
-if vals["longitude"] is None:
-    # if no longitude, record the problem and continue — don't raise IndexError
-    print(f"compute_chart: no longitude for planet {name}; raw res={res!r}")
-    planets_out[name] = {"longitude": None, "latitude": vals["latitude"], "speed_long": vals["speed_long"]}
-else:
-    lon_deg = normalize_angle(vals["longitude"])
-    planets_out[name] = {"longitude": lon_deg, "latitude": vals["latitude"], "speed_long": vals["speed_long"]}
+def _parse_place_to_latlon(place_str: str):
+    """
+    Accept a place string in the form "lat,lon" and return (lat, lon).
+    If not parseable, return (None, None) — caller may try geocoding if desired.
+    """
+    try:
+        parts = [p.strip() for p in place_str.split(",")]
+        if len(parts) >= 2:
+            lat = float(parts[0])
+            lon = float(parts[1])
+            # sanity check ranges
+            if -90 <= lat <= 90 and -180 <= lon <= 180:
+                return lat, lon
+    except Exception:
+        pass
+    return None, None
+
+# -----------------------
+# compute_chart endpoint
+# -----------------------
+@app.post("/compute_chart")
+def compute_chart(payload: BirthData):
+    """
+    Compute planetary longitudes, house cusps and ascendant.
+    Returns an object containing 'planets', 'houses', 'ascendant', and input/utc_birth.
+    This implementation is defensive and will return helpful error JSON if required fields cannot be computed.
+    """
+    data = payload.dict()
+    # 1) parse lat/lon from explicit fields or place string "lat,lon"
+    lat = payload.lat
+    lon = payload.lon
+    if lat is None or lon is None:
+        latlon = _parse_place_to_latlon(payload.place)
+        if latlon != (None, None):
+            lat, lon = latlon
+
+    if lat is None or lon is None:
+        # We deliberately require lat/lon or a lat,lon place string. If you want geocoding, add geopy.
+        return JSONResponse(status_code=422, content={
+            "error": "missing_latlon",
+            "message": "Please provide latitude and longitude either via 'lat' and 'lon' fields or as 'place' in the form 'lat,lon'."
+        })
+
+    # 2) parse date/time -> UTC and JD
+    try:
+        dt_utc, jd_ut = _parse_datetime_to_utc_jd(payload.date, payload.time, payload.timezone)
+    except Exception as e:
+        return JSONResponse(status_code=422, content={
+            "error": "invalid_datetime",
+            "message": str(e)
+        })
+
+    # 3) Build planets
+    # Use common SWEP constants
+    planet_ids = {
+        "Sun": swe.SUN,
+        "Moon": swe.MOON,
+        "Mercury": swe.MERCURY,
+        "Venus": swe.VENUS,
+        "Mars": swe.MARS,
+        "Jupiter": swe.JUPITER,
+        "Saturn": swe.SATURN,
+        # use mean lunar node for Rahu (name as 'Rahu') and Ketu as opposite point
+        "Rahu": swe.MEAN_NODE,
+        "Ketu": swe.TRUE_NODE  # if you prefer Ketu = Rahu+180 adjust later
+    }
+
+    planets_out = {}
+    for name, pid in planet_ids.items():
+        try:
+            # call Swiss Ephemeris; calc_ut may return tuple/list or scalar depending on flags/version
+            res = swe.calc_ut(jd_ut, pid)
+        except Exception as e:
+            print(f"Ephemeris call failed for {name}: {e}")
+            res = None
+
+        vals = _extract_from_res(res)
+        if vals["longitude"] is None:
+            # log and continue (do not crash)
+            print(f"compute_chart: missing longitude for {name}; raw res={res!r}")
+            planets_out[name] = {
+                "longitude": None,
+                "latitude": vals.get("latitude"),
+                "speed_long": vals.get("speed_long")
+            }
+        else:
+            lon_deg = normalize_angle(vals["longitude"])
+            planets_out[name] = {
+                "longitude": lon_deg,
+                "latitude": vals.get("latitude"),
+                "speed_long": vals.get("speed_long")
+            }
+
+    # 4) Houses & Ascendant
+    # Swiss Ephemeris: swe.houses(jd_ut, lat, lon) -> (cusps, ascmc)
+    try:
+        cusps, ascmc = swe.houses(jd_ut, lat, lon)
+        # cusps is an array-like with 13 entries (1..12)
+        houses = {}
+        # ensure numeric keys "1".."12"
+        for i in range(1, 13):
+            try:
+                houses[str(i)] = normalize_angle(cusps[i])
+            except Exception:
+                houses[str(i)] = None
+        # ascendant value usually ascmc[0]
+        asc_value = None
+        try:
+            asc_value = normalize_angle(ascmc[0])
+        except Exception:
+            asc_value = None
+    except Exception as e:
+        print(f"House calculation failed: {e}")
+        houses = {str(i): None for i in range(1, 13)}
+        asc_value = None
+
+    # 5) Validate minimal outputs (planets dict must have Jupiter, houses must include 5th)
+    missing = []
+    if "Jupiter" not in planets_out or planets_out["Jupiter"]["longitude"] is None:
+        missing.append("planet:Jupiter")
+    if houses.get("5") is None:
+        missing.append("house:5")
+    if asc_value is None:
+        missing.append("ascendant")
+
+    if missing:
+        # return helpful diagnostic JSON for GPT and debugging
+        return JSONResponse(status_code=500, content={
+            "error": "incomplete_chart",
+            "missing_fields": missing,
+            "input": data,
+            "planets_sample": {k: v for k, v in list(planets_out.items())[:5]},
+            "houses_sample": {k: houses[k] for k in list(houses.keys())[:6]}
+        })
+
+    # 6) Build and return response
+    response = {
+        "input": data,
+        "utc_birth": dt_utc.isoformat(),
+        "planets": planets_out,
+        "ascendant": asc_value,
+        "houses": houses
+    }
+    return response
 
 
     # compute Ketu as Rahu + 180
@@ -329,5 +413,7 @@ def compute_dasha(data: BirthData):
 
 # To run:
 # uvicorn astro_service_with_dasha:app --port 8000 --reload
+
+
 
 
