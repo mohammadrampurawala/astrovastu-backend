@@ -86,28 +86,37 @@ def normalize_angle(deg):
 
 def _extract_from_res(res):
     """
-    Accepts res which might be:
-     - a float/number
-     - a tuple/list with elements (longitude, latitude, distance, speed_long, ...)
+    Robust extractor for pyswisseph results.
+    Handles:
+      - scalar (float)
+      - tuple/list of values (lon, lat, dist, speed, ...)
+      - nested ( (lon, lat, ...), flag ) returned by some swisseph versions
     Returns dict with keys: longitude, latitude, speed_long (values may be None).
     """
     out = {"longitude": None, "latitude": None, "speed_long": None}
+
+    # Unwrap one level if result looks like (data_tuple, flag_int)
+    if isinstance(res, (list, tuple)) and len(res) == 2:
+        first, second = res[0], res[1]
+        # Heuristic: if first is a tuple/list and second is an int flag, unwrap
+        if isinstance(first, (list, tuple)) and (isinstance(second, int) or isinstance(second, float)):
+            res = first
+
     try:
-        # sequence-like
         if isinstance(res, (list, tuple)):
-            if len(res) >= 1:
+            if len(res) >= 1 and res[0] is not None:
                 out["longitude"] = float(res[0])
-            if len(res) >= 2:
+            if len(res) >= 2 and res[1] is not None:
                 out["latitude"] = float(res[1])
-            if len(res) >= 4:
+            if len(res) >= 4 and res[3] is not None:
                 out["speed_long"] = float(res[3])
         else:
-            # scalar case (just a number)
+            # scalar case
             out["longitude"] = float(res)
     except Exception as e:
-        # log for debugging; Render will show prints
         print(f"Warning: unable to parse ephemeris result {res!r} -> {e}")
     return out
+
 
 def _parse_datetime_to_utc_jd(date_str: str, time_str: str, tz_name: str | None):
     """
@@ -413,6 +422,7 @@ def compute_dasha(data: BirthData):
 
 # To run:
 # uvicorn astro_service_with_dasha:app --port 8000 --reload
+
 
 
 
