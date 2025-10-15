@@ -1,0 +1,21 @@
+# Core Web Framework
+fastapi[standard]==0.115.0
+uvicorn[standard]==0.30.6
+
+# Astronomy & Ephemeris Calculations
+pyswisseph==2.10.3.2
+
+# Geolocation and Timezone
+timezonefinder==6.2.0
+geopy==2.4.1
+pytz==2024.1
+python-dateutil==2.9.0.post0
+
+# Math and Utility
+numpy==1.26.4
+h3==3.7.6
+
+# Optional helpers
+pandas==2.2.2
+requests==2.31.0
+loguru==0.7.2
