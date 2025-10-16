@@ -207,9 +207,8 @@ def compute_chart(payload: BirthData):
         "Mars": swe.MARS,
         "Jupiter": swe.JUPITER,
         "Saturn": swe.SATURN,
-        # use mean lunar node for Rahu (name as 'Rahu') and Ketu as opposite point
-        "Rahu": swe.MEAN_NODE,
-        "Ketu": swe.TRUE_NODE  # if you prefer Ketu = Rahu+180 adjust later
+        # use mean lunar node for Rahu; compute Ketu as Rahu+180 later
+        "Rahu": swe.MEAN_NODE
     }
 
     planets_out = {}
@@ -280,7 +279,19 @@ def compute_chart(payload: BirthData):
             "houses_sample": {k: houses[k] for k in list(houses.keys())[:6]}
         })
 
-    # 6) Build and return response
+      # 6) Add Ketu computed from Rahu (if Rahu present) and return response
+    try:
+        # If Rahu longitude exists, compute Ketu as Rahu + 180
+        rahu_lon_val = planets_out.get('Rahu', {}).get('longitude')
+        if rahu_lon_val is not None:
+            ketu_lon = normalize_angle(rahu_lon_val + 180.0)
+            planets_out['Ketu'] = {'longitude': ketu_lon, 'latitude': None, 'speed_long': None}
+        else:
+            # keep Ketu key but mark it missing if Rahu missing
+            planets_out.setdefault('Ketu', {'longitude': None, 'latitude': None, 'speed_long': None})
+    except Exception:
+        planets_out.setdefault('Ketu', {'longitude': None, 'latitude': None, 'speed_long': None})
+
     response = {
         "input": data,
         "utc_birth": dt_utc.isoformat(),
@@ -289,29 +300,6 @@ def compute_chart(payload: BirthData):
         "houses": houses
     }
     return response
-
-
-    # compute Ketu as Rahu + 180
-    rahu_lon = planets_out['Rahu']['longitude']
-    ketu_lon = normalize_angle(rahu_lon + 180.0)
-    planets_out['Ketu'] = {'longitude': ketu_lon, 'latitude': None, 'speed_long': None}
-
-    # houses & ascendant
-    hsys = 'P'
-    cusps, ascmc = swe.houses(jd_ut, lat, lon, hsys)
-    asc = normalize_angle(ascmc[0])
-    mc = normalize_angle(ascmc[1])
-    houses = {f"house_{i+1}": cusps[i] for i in range(12)}
-
-    return {
-        'input': {'date': data.date, 'time': data.time, 'place': data.place, 'lat': lat, 'lon': lon, 'timezone': tz_name, 'sidereal': data.sidereal},
-        'utc_birth': utc_dt.isoformat(),
-        'jd_ut': jd_ut,
-        'planets': planets_out,
-        'ascendant': asc,
-        'mc': mc,
-        'houses': houses
-    }
 
 # ---- Dasha / Nakshatra utilities ----
 def moon_to_nakshatra_index(moon_longitude_deg):
@@ -381,14 +369,69 @@ def build_antardashas_for_mahadasha(maha_planet, maha_start_dt, maha_years):
 
 @app.post("/compute_dasha")
 def compute_dasha(data: BirthData):
-    # reuse compute_chart minimal steps to get moon lon and birth utc dt
-    lat, lon = parse_place(data.place, data.lat, data.lon)
-    tz_name = data.timezone or tzfinder.timezone_at(lat=lat, lng=lon)
+    # 1) Resolve lat/lon (prefer explicit fields; fallback to "lat,lon" in place)
+    lat = data.lat
+    lon = data.lon
+    if lat is None or lon is None:
+        latlon = _parse_place_to_latlon(data.place)
+        if latlon != (None, None):
+            lat, lon = latlon
+
+    if lat is None or lon is None:
+        raise HTTPException(status_code=422, detail="Please provide latitude and longitude either via 'lat'/'lon' or as 'place' in 'lat,lon' format.")
+
+    # 2) Parse local date/time -> UTC datetime and JD (reuse helper)
     try:
-        utc_dt = local_to_utc_datetime(data.date, data.time, tz_name, lat, lon)
+        utc_dt, jd_ut = _parse_datetime_to_utc_jd(data.date, data.time, data.timezone)
     except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    jd_ut = jd_from_utc_dt(utc_dt)
+        raise HTTPException(status_code=422, detail=f"Invalid date/time/timezone: {e}")
+
+    # 3) Sidereal / tropical selection:
+    # If sidereal requested, set a sidereal mode; otherwise set no sidereal (0)
+    try:
+        if data.sidereal:
+            swe.set_sid_mode(swe.SIDM_LAHIRI)
+        else:
+            swe.set_sid_mode(0)  # 0 disables sidereal corrections (tropical)
+    except Exception:
+        # If the library doesn't expose constants exactly, ignore and proceed
+        pass
+
+    # 4) Get Moon longitude safely (calc_ut may return tuple/list)
+    try:
+        moon_res = swe.calc_ut(jd_ut, swe.MOON)
+        moon_vals = _extract_from_res(moon_res)
+        moon_lon = normalize_angle(moon_vals["longitude"]) if moon_vals["longitude"] is not None else None
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Ephemeris error while computing Moon: {e}")
+
+    if moon_lon is None:
+        raise HTTPException(status_code=500, detail="Unable to compute Moon longitude from ephemeris.")
+
+    # 5) Build mahadasha sequence and nested antardashas
+    maha_info = build_mahadasha_sequence(moon_lon, utc_dt)
+    for maha in maha_info["mahadasha_sequence"]:
+        start_dt = datetime.fromisoformat(maha["start_utc"])
+        duration_years = maha["duration_years"]
+        maha["antardashas"] = build_antardashas_for_mahadasha(maha["planet"], start_dt, duration_years)
+
+    result = {
+        "input": {
+            "date": data.date,
+            "time": data.time,
+            "place": data.place,
+            "lat": lat,
+            "lon": lon,
+            "timezone": data.timezone,
+            "sidereal": data.sidereal
+        },
+        "utc_birth": utc_dt.isoformat(),
+        "moon_longitude": moon_lon,
+        "nakshatra_index": maha_info["nakshatra_index"],
+        "nakshatra_fraction": maha_info["nakshatra_fraction"],
+        "mahadasha_sequence": maha_info["mahadasha_sequence"]
+    }
+    return result
 
     # sidereal?
     if data.sidereal:
@@ -422,6 +465,7 @@ def compute_dasha(data: BirthData):
 
 # To run:
 # uvicorn astro_service_with_dasha:app --port 8000 --reload
+
 
 
 
