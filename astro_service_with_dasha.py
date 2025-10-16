@@ -25,6 +25,25 @@ from fastapi.responses import JSONResponse
 import math
 
 app = FastAPI(title="Astro Service with Dasha")
+@app.get("/", tags=["meta"])
+def root():
+    """
+    Simple root index so that GET / returns 200 for platform health checks.
+    Also points users to the OpenAPI docs.
+    """
+    return {
+        "service": "AstroVastu Pro API",
+        "version": "1.0.0",
+        "status": "running",
+        "endpoints": ["/compute_chart", "/compute_dasha", "/docs", "/openapi.json"],
+        "note": "Use /docs to explore the API"
+    }
+
+@app.get("/health", tags=["meta"])
+def health():
+    """Simple health check for deployment platforms."""
+    return {"status": "ok"}
+
 
 # Set ephemeris path if you have local ephe files, otherwise default built-ins
 swe.set_ephe_path('.')
@@ -465,6 +484,7 @@ def compute_dasha(data: BirthData):
 
 # To run:
 # uvicorn astro_service_with_dasha:app --port 8000 --reload
+
 
 
 
